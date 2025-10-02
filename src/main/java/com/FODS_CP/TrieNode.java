@@ -13,13 +13,20 @@ public class TrieNode {
     private final Map<Character, TrieNode> children = new HashMap<>();
 
     // This flag is true if this node represents the end of a complete word.
-    @Setter
     private boolean isEndOfWord;
 
-    // We store the frequency of the word at its final node.
-    @Setter
     private long frequency;
 
+    public void setEndOfWord(boolean endOfWord) {
+        // This setter assigns the boolean value.
+        isEndOfWord = endOfWord;
+    }
+
+    public void setFrequency(long frequency) {
+        // This is the most critical setter.
+        // It MUST assign the passed-in frequency to the class field.
+        this.frequency = frequency;
+    }
     // Standard Getters and Setters
 
     public Map<Character, TrieNode> getChildren() {

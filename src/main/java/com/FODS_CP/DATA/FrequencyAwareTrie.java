@@ -4,6 +4,7 @@ package com.FODS_CP.DATA;
 import com.FODS_CP.Suggestion;
 import com.FODS_CP.TrieNode;
 import jdk.jshell.SourceCodeAnalysis;
+import org.apache.commons.text.similarity.LevenshteinDistance;
 import org.springframework.core.PriorityOrdered;
 import org.springframework.stereotype.Service;
 
@@ -16,21 +17,30 @@ import java.util.stream.Collectors;
 
 @Service
 public class FrequencyAwareTrie {
-
+    private final WordFrequencyService wordFrequencyService;
+    private final LevenshteinDistance levenshteinDistance;
     private final TrieNode root;
     private static final int SUGGESTION_LIMIT = 10;
 
-    public FrequencyAwareTrie() {
-        // The root node is empty and doesn't represent any character.
+    public FrequencyAwareTrie(WordFrequencyService wordFrequencyService) {
+        this.wordFrequencyService = wordFrequencyService;
+        this.levenshteinDistance = new LevenshteinDistance(1);
         root = new TrieNode();
-
     }
-
-    /**
-     * Inserts a word into the Trie along with its frequency.
-     * @param word The word to insert.
-     * @param frequency The frequency of the word.
-     */
+    public List<String> getFuzzySuggestions(String missSpelledWord){
+        List<Suggestion> fuzzyMatches = new ArrayList<>();
+        for(String word : wordFrequencyService.getWordFrequencies().keySet()){
+            if(levenshteinDistance.apply(word, missSpelledWord) != -1){
+                long frequency = wordFrequencyService.getWordFrequencies().get(word);
+                fuzzyMatches.add(new Suggestion(word , frequency));
+            }
+        }
+        return fuzzyMatches.stream()
+                .sorted(Comparator.comparingLong(Suggestion::frequency).reversed())
+                .limit(SUGGESTION_LIMIT)
+                .map(Suggestion::word)
+                .collect(Collectors.toList());
+    }
     public void insert(String word, long frequency) {
         TrieNode current = root;
         for (char ch : word.toCharArray()) {
