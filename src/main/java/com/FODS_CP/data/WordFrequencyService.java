@@ -1,4 +1,4 @@
-package com.FODS_CP.DATA;
+package com.FODS_CP.data;
 import org.springframework.stereotype.Service;
 import java.util.Collections;
 import java.util.Map;

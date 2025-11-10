@@ -1,4 +1,4 @@
-package com.FODS_CP.DATA;
+package com.FODS_CP.data;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
@@ -26,7 +26,7 @@ public class FrequencyCsvLoader implements CommandLineRunner {
                               FrequencyAwareTrie trie) { // <-- ADD THIS
         this.resourceLoader = resourceLoader;
         this.wordFrequencyService = wordFrequencyService;
-        this.trie = trie; // <-- ADD THIS
+        this.trie = trie;
     }
 
     @Override
@@ -60,5 +60,9 @@ public class FrequencyCsvLoader implements CommandLineRunner {
             trie.insert(entry.getKey(), entry.getValue());
         }
         System.out.println("Trie has been built successfully.");
+    }
+
+    public void loadCsvAndPopulateTrie() {
+
     }
 }

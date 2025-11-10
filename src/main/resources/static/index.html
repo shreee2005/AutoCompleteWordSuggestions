@@ -1,22 +1,29 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Word Autocomplete</title>
-    <link rel="stylesheet" href="style.css">
+    <meta charset="utf-8"/>
+    <title>Autocomplete demo</title>
+    <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+<main class="container">
+    <h1>Autocomplete demo</h1>
+    <p id="intro">Type anything to see suggestions. Empty input shows trending words.</p>
 
-<div class="container">
-    <h1>Word Autocomplete</h1>
-    <p>Start typing a word to see suggestions from the backend.</p>
-    <div class="autocomplete-container">
-        <input type="text" id="searchInput" placeholder="Type here...">
-        <ul id="suggestionsList"></ul>
+    <div class="predictive-box search-box">
+        <input id="searchInput" type="text" autocomplete="off" placeholder="Start typing..." />
+        <!-- suggestions must be a child of the same container for absolute positioning -->
+        <ul id="suggestionsList" class="suggestions" hidden></ul>
     </div>
-</div>
 
-<script src="script.js"></script>
+    <div id="debug" class="debug" hidden></div>
+
+    <section>
+        <h3>Trending</h3>
+        <ul id="trendingList"></ul>
+    </section>
+</main>
+
+<script src="/script.js"></script>
 </body>
 </html>
