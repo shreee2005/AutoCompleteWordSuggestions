@@ -6,7 +6,6 @@ import com.FODS_CP.service.CategoryService;
 import com.FODS_CP.service.NGramService;
 import com.FODS_CP.service.Suggestion;
 import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Tags;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -61,28 +60,26 @@ public class AutocompleteController {
             try {
                 @SuppressWarnings("unchecked")
                 List<Suggestion> cached = (List<Suggestion>) cachedRaw;
-                meterRegistry.counter("autocomplete.requests", "result", "cache-hit").increment();
+                if (meterRegistry != null)
+                    meterRegistry.counter("autocomplete.requests", "result", "cache-hit").increment();
                 long took = System.currentTimeMillis() - start;
-                return ResponseEntity.ok(new SuggestResponse(prefix, cached, new Meta(true, "v1", took)));
+                return ResponseEntity.ok(new SuggestResponse(prefix, cached, new Meta(true, "v1", took), null));
             } catch (Throwable t) {
                 // fall through and recompute if casting failed
             }
         }
-        // cache miss
-        meterRegistry.counter("autocomplete.requests", "result", "cache-miss").increment();
+        if (meterRegistry != null)
+            meterRegistry.counter("autocomplete.requests", "result", "cache-miss").increment();
 
         // If prefix is empty -> user typed a space => provide next-word phrase suggestions from n-gram
         if (prefix.isEmpty()) {
             List<NGramService.Candidate> candidates = nGramService.getNextWordCandidates(ctx, Math.max(limit * 2, 10));
             List<Suggestion> out = new ArrayList<>();
             for (NGramService.Candidate c : candidates) {
-                // Build full phrase (context + nextWord). If ctx empty, phrase is just the nextWord.
-                // NOTE: this assumes Candidate has fields 'word' and 'count'. If your Candidate uses 'prob' instead,
-                // adapt this line accordingly in your NGramService.
+                if (c == null || c.word == null) continue;
                 String phrase = ctx.isEmpty() ? c.word : (ctx + " " + c.word);
-                long freqProxy = (long) ( (c instanceof NGramService.Candidate) ? ( (long) (Double.isNaN(getCandidateCountSafe(c)) ? 0L : getCandidateCountSafe(c)) ) : 0L );
-                // fallback: use 1 if we cannot extract numeric count
-                if (freqProxy <= 0) freqProxy = 1L;
+                double cnt = getCandidateCountSafe(c);
+                long freqProxy = Math.max(1, Math.round(cnt));
                 Suggestion s = new Suggestion(phrase, freqProxy);
                 double ngramScore = getCandidateProbSafe(c);
                 double score = computeScore(s.getFrequency(), Math.log(ngramScore + 1e-9), s.getLastUsedEpochMillis(), 1.0, 0.0);
@@ -93,46 +90,36 @@ public class AutocompleteController {
             List<Suggestion> top = out.size() > limit ? out.subList(0, limit) : out;
             suggestionCache.put(cacheKey, top);
             long took = System.currentTimeMillis() - start;
-            meterRegistry.timer("autocomplete.latency").record(took, java.util.concurrent.TimeUnit.MILLISECONDS);
-            return ResponseEntity.ok(new SuggestResponse(prefix, top, new Meta(false, "v1", took)));
+            if (meterRegistry != null)
+                meterRegistry.timer("autocomplete.latency").record(took, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return ResponseEntity.ok(new SuggestResponse(prefix, top, new Meta(false, "v1", took), null));
         }
 
-        // --- prefix non-empty: combine trie suggestions for this prefix (word completions)
-        // --- with n-gram next-word candidates that match this prefix (i.e., beginning characters of next word)
+        // --- prefix non-empty ---
         List<Suggestion> trieCandidates = trie.getSuggestions(prefix, Math.max(limit * 8, 30));
-
-        // n-gram candidates are next-word predictions based on ctx
         List<NGramService.Candidate> ng = nGramService.getNextWordCandidates(ctx, 20);
 
-        // Merge bucket keyed by displayText (lowercase). We will create phrase text for n-grams when ctx present.
         Map<String, Suggestion> bucket = new HashMap<>();
-        // Add trie completions (these are single words; we'll convert to phrase if context exists when returning)
         if (trieCandidates != null) {
             for (Suggestion s : trieCandidates) {
-                if (s != null && s.getText() != null) {
+                if (s != null && s.getText() != null)
                     bucket.put(s.getText().toLowerCase(), s);
-                }
             }
         }
 
-        // Add n-gram candidates but only those that match the prefix (startWith)
         if (ng != null) {
             for (NGramService.Candidate c : ng) {
                 if (c == null || c.word == null) continue;
                 String nextWord = c.word;
-                if (!nextWord.toLowerCase().startsWith(prefix.toLowerCase())) {
-                    continue; // ignore n-gram words that don't match the user-typed prefix
-                }
-                // Build phrase display text
+                if (!nextWord.toLowerCase().startsWith(prefix.toLowerCase())) continue;
                 String phrase = ctx.isEmpty() ? nextWord : (ctx + " " + nextWord);
                 if (!bucket.containsKey(phrase.toLowerCase())) {
-                    long freqProxy = (long) Math.max(1, Math.round(getCandidateCountSafe(c)));
+                    long freqProxy = Math.max(1, Math.round(getCandidateCountSafe(c)));
                     bucket.put(phrase.toLowerCase(), new Suggestion(phrase, freqProxy));
                 }
             }
         }
 
-        // Fuzzy: apply fuzzy only against the current token (prefix), not the whole input.
         if (trieCandidates == null || trieCandidates.isEmpty() || prefix.length() >= 2) {
             List<Suggestion> fuzzy = trie.getNearbyByFuzzy(prefix, 20);
             if (fuzzy != null) {
@@ -144,43 +131,65 @@ public class AutocompleteController {
             }
         }
 
-        // Scoring & personalization: compute scores for display phrases
         List<Suggestion> combined = new ArrayList<>(bucket.values());
-        for (int i = 0; i < combined.size(); i++) {
-            Suggestion s = combined.get(i);
+        for (Suggestion s : combined) {
             if (s == null) continue;
-            // compute suffix and ngramScore
             String display = s.getText();
             String suffixWord = display.contains(" ") ? display.substring(display.lastIndexOf(' ') + 1) : display;
-            double ngramScore = findNGramScore(suffixWord, ng); // uses candidate word counts
-            double fuzzySim = computeFuzzySim(prefix, suffixWord); // fuzzy between current token and suffix
+            double ngramScore = findNGramScore(suffixWord, ng);
+            double fuzzySim = computeFuzzySim(prefix, suffixWord);
             long lastUsed = s.getLastUsedEpochMillis();
             long freq = s.getFrequency();
 
             double personalBoost = 0.0;
             if (userId != null && !userId.isBlank()) {
                 try {
-                    Map<String,Integer> uc = userStore.getUser(userId);
+                    Map<String, Integer> uc = userStore.getUser(userId);
                     if (uc != null) personalBoost = uc.getOrDefault(display.toLowerCase(), 0);
                 } catch (Throwable ignore) {
-                    // defensive: if userStore API differs, fall back to zero
                     personalBoost = 0.0;
                 }
             }
 
             double score = computeScore(freq, ngramScore, lastUsed, fuzzySim, personalBoost);
             s.setScore(score);
-            combined.set(i, s);
         }
 
         combined.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
         List<Suggestion> out = combined.size() > limit ? combined.subList(0, limit) : combined;
 
+        // ====== FIXED DID-YOU-MEAN BLOCK ======
+        String didYouMean = null;
+        try {
+            if (prefix != null && prefix.length() >= 2) {
+                Optional<String> direct = trie.findDidYouMean(prefix);
+                if (direct.isPresent() && !direct.get().equalsIgnoreCase(prefix)) {
+                    didYouMean = direct.get();
+                } else {
+                    List<Suggestion> fuzzyList = trie.getNearbyByFuzzy(prefix, 5);
+                    if (fuzzyList != null && !fuzzyList.isEmpty()) {
+                        String candidate = fuzzyList.get(0).getText();
+                        if (candidate != null && !candidate.equalsIgnoreCase(prefix)) {
+                            double sim = com.FODS_CP.service.Fuzzy.similarity(prefix, candidate);
+                            if (sim >= 0.7) {
+                                didYouMean = candidate;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            System.out.println("[DidYouMean] error: " + t.getMessage());
+        }
+
+        // ====== FINAL RETURN ======
         suggestionCache.put(cacheKey, out);
         long took = System.currentTimeMillis() - start;
-        meterRegistry.timer("autocomplete.latency").record(took, java.util.concurrent.TimeUnit.MILLISECONDS);
-        return ResponseEntity.ok(new SuggestResponse(prefix, out, new Meta(false, "v1", took)));
+        if (meterRegistry != null)
+            meterRegistry.timer("autocomplete.latency").record(took, java.util.concurrent.TimeUnit.MILLISECONDS);
+        return ResponseEntity.ok(new SuggestResponse(prefix, out, new Meta(false, "v1", took), didYouMean));
     }
+
 
 
 
@@ -215,7 +224,7 @@ public class AutocompleteController {
     // --- trending endpoint for demo (top N by global frequency) ---
     @GetMapping("/trending")
     public ResponseEntity<List<String>> trending(@RequestParam(value="limit", defaultValue = "10") int limit) {
-        Map<String, Long> dict = trie.getWordFrequencyMap(); // helper in trie expected
+        Map<String, Long> dict = trie.getVocabulary(); // helper in trie expected
         List<String> list = dict.entrySet().stream()
                 .sorted(Map.Entry.<String,Long>comparingByValue().reversed())
                 .limit(limit)
@@ -243,6 +252,21 @@ public class AutocompleteController {
         m.put("cacheMiss", cacheMiss);
         m.put("requestsTotal", cacheHits + cacheMiss);
         return ResponseEntity.ok(m);
+    }
+
+    @GetMapping("/debug/didyoumean")
+    public ResponseEntity<Map<String,Object>> debugDidYouMean(@RequestParam("word") String word) {
+        Map<String,Object> out = new LinkedHashMap<>();
+        try {
+            out.put("input", word);
+            out.put("vocabSize", trie.getVocabulary() == null ? 0 : trie.getVocabulary().size());
+            Optional<String> d = trie.findDidYouMean(word);
+            out.put("didYouMean", d.orElse(null));
+            return ResponseEntity.ok(out);
+        } catch (Throwable t) {
+            out.put("error", t.getMessage());
+            return ResponseEntity.status(500).body(out);
+        }
     }
 
     // helpers unchanged (copy from your prior controller)
@@ -283,6 +307,7 @@ public class AutocompleteController {
 
     // Utility: try to extract numeric 'count' from candidate (works with multiple shapes)
     private double getCandidateCountSafe(NGramService.Candidate c) {
+        if (c == null) return 0.0;
         try {
             // If Candidate has a 'count' field (int/long)
             var field = c.getClass().getDeclaredField("count");
@@ -329,12 +354,14 @@ public class AutocompleteController {
         private String prefix;
         private List<Suggestion> suggestions;
         private Meta meta;
-        public SuggestResponse(String prefix, List<Suggestion> suggestions, Meta meta) {
-            this.prefix = prefix; this.suggestions = suggestions; this.meta = meta;
+        private String didYouMean;
+        public SuggestResponse(String prefix, List<Suggestion> suggestions, Meta meta , String didYouMean) {
+            this.prefix = prefix; this.suggestions = suggestions; this.meta = meta; this.didYouMean = didYouMean;
         }
         public String getPrefix() { return prefix; }
         public List<Suggestion> getSuggestions() { return suggestions; }
         public Meta getMeta() { return meta; }
+        public String getDidYouMean() { return didYouMean; }
     }
 
     public static class Meta {

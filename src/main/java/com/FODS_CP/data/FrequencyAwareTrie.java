@@ -88,6 +88,74 @@ public class FrequencyAwareTrie {
         }
     }
 
+    public Optional<String> findDidYouMean(String input) {
+        if (input == null || input.isBlank()) return Optional.empty();
+        String token = input.trim().toLowerCase();
+
+        // quick guard: if token exists exactly, no correction
+        Map<String, Long> vocabSnapshot = getVocabulary();
+        if (vocabSnapshot == null || vocabSnapshot.isEmpty()) {
+            System.out.println("[DYM] vocab empty");
+            return Optional.empty();
+        }
+        if (vocabSnapshot.containsKey(token)) {
+            return Optional.empty();
+        }
+
+        String best = null;
+        double bestScore = 0.0;
+
+        // iterate vocabulary (O(V)). For large vocab replace with BK-tree later.
+        for (String w : vocabSnapshot.keySet()) {
+            if (w == null || w.isBlank()) continue;
+            String cand = w.toLowerCase();
+            if (cand.equals(token)) continue;
+
+            double sim;
+            try {
+                sim = com.FODS_CP.service.Fuzzy.similarity(token, cand);
+            } catch (Throwable t) {
+                // fallback to simple prefix check
+                sim = cand.startsWith(token) ? 0.6 : 0.0;
+            }
+
+            // small boost for same starting letter(s)
+            if (cand.charAt(0) == token.charAt(0)) sim += 0.02;
+
+            if (sim > bestScore) {
+                bestScore = sim;
+                best = w;
+            }
+        }
+
+        System.out.println("[DYM] token='" + token + "' best='" + best + "' score=" + bestScore + " vocabSize=" + vocabSnapshot.size());
+
+        // threshold: tune 0.70-0.80; use 0.75 conservative
+        if (best != null && bestScore >= 0.75) return Optional.of(best);
+        return Optional.empty();
+    }
+
+    public Map<String, Long> getVocabulary() {
+        // return snapshot (thread-safe)
+        Map<String, Long> snapshot = new HashMap<>();
+        try {
+            // if you use a field `vocab` in trie, return new HashMap<>(vocab)
+            // otherwise derive from WordFrequencyService:
+            if (this.getVocabulary() != null && !this.getVocabulary().isEmpty()) {
+                snapshot.putAll(this.getVocabulary());
+                return snapshot;
+            }
+        } catch (Throwable ignored) {}
+        // fallback: try to ask WordFrequencyService if present
+        try {
+            if (this.wordFrequencyService != null && this.wordFrequencyService.getWordFrequencies() != null) {
+                snapshot.putAll(this.wordFrequencyService.getWordFrequencies());
+            }
+        } catch (Throwable ignored) {}
+        return snapshot;
+    }
+
+
     private TrieNode findNodeForPrefix(String prefix) {
         TrieNode current = root;
         for (char ch : prefix.toCharArray()) {

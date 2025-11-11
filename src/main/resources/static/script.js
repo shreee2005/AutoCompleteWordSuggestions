@@ -1,4 +1,5 @@
 // Stable dropdown-only frontend (no inline grey prediction)
+// Adds robust "Did you mean" UI + keyboard handling
 
 const searchInput = document.getElementById("searchInput");
 const suggestionsList = document.getElementById("suggestionsList");
@@ -51,8 +52,6 @@ function acceptSuggestion(selected) {
         const lowerContext = context.toLowerCase();
         if (lowerSel.startsWith(lowerContext)) {
             // Replace everything up to the start of current prefix with the phrase
-            const trimmedEnd = full.replace(/\s+$/, "");
-            const lastSpace = trimmedEnd.lastIndexOf(" ");
             const leftPart = full.slice(0, full.lastIndexOf(prefix)); // preserve any leading whitespace positions
             searchInput.value = (leftPart + sel).trim() + " ";
             hideSuggestions();
@@ -74,6 +73,8 @@ function acceptSuggestion(selected) {
     }
 
     hideSuggestions();
+    // report acceptance to backend (personalization)
+    postAccept(sel);
     fetchSuggestionsAfterInsert(searchInput.value);
 }
 
@@ -85,12 +86,20 @@ function fetchSuggestionsAfterInsert(newFullValue) {
     fetchSuggestions("", ctx);
 }
 
+function postAccept(selected) {
+    const userId = localStorage.getItem('demoUserId') || '';
+    fetch('/api/accept', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ userId: userId, selected: selected })
+    }).catch(() => {});
+}
+
 // ---------------- Fetch + Render ----------------
 async function fetchSuggestions(prefix, context) {
     try {
         const limit = 6;
-        const url = `/api/suggest?q=${encodeURIComponent(prefix)}&context=${encodeURIComponent(context)}&limit=${limit}`;
-        const resp = await fetch(url, { headers: { "Accept": "application/json" }});
+        const resp = await fetch(`/api/suggest?q=${encodeURIComponent(prefix)}&context=${encodeURIComponent(context)}&limit=${limit}`);
         if (!resp.ok) {
             hideSuggestions();
             showDebug(`HTTP ${resp.status}`);
@@ -99,7 +108,11 @@ async function fetchSuggestions(prefix, context) {
         const body = await resp.json();
         const items = Array.isArray(body?.suggestions) ? body.suggestions : [];
         suggestions = items.map(s => (typeof s === "string") ? s : (s.text ?? s.word ?? "")).filter(Boolean);
-        displaySuggestions(suggestions, prefix);
+
+        // Get Did You Mean suggestion
+        const dym = body?.didYouMean ?? body?.didyoumean ?? null;
+
+        displaySuggestions(suggestions, prefix, dym);
         showDebug(`took ${body?.meta?.tookMs ?? "?"} ms • ${suggestions.length}`);
     } catch (err) {
         console.error("fetch error", err);
@@ -107,12 +120,67 @@ async function fetchSuggestions(prefix, context) {
     }
 }
 
-function displaySuggestions(words, prefix) {
+function insertDidYouMeanRow(replacement) {
+    // remove existing didyoumean row if any
+    const existing = suggestionsList.querySelector("li.didyoumean");
+    if (existing) existing.remove();
+
+    const hintLi = document.createElement("li");
+    hintLi.className = "didyoumean";
+    hintLi.tabIndex = 0;
+    hintLi.dataset.value = replacement;
+    hintLi.innerHTML = `Did you mean: <strong>${escapeHtml(replacement)}</strong>? (click or press Enter)`;
+    hintLi.addEventListener("click", () => {
+        applyDidYouMean(replacement);
+        postAccept(replacement);
+    });
+    hintLi.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            hintLi.click();
+        }
+    });
+
+    // insert at top
+    suggestionsList.insertBefore(hintLi, suggestionsList.firstChild);
+}
+
+// Apply replacement into input and fetch next suggestions
+function applyDidYouMean(replacement) {
+    const full = searchInput.value;
+    const trimmedEnd = full.replace(/\s+$/, '');
+    const lastSpace = trimmedEnd.lastIndexOf(' ');
+    if (lastSpace === -1) {
+        searchInput.value = replacement + ' ';
+    } else {
+        const left = full.substring(0, lastSpace + 1); // include trailing space
+        searchInput.value = left + replacement + ' ';
+    }
+    const parts = searchInput.value.trim().split(/\s+/);
+    const newContext = parts.slice(Math.max(0, parts.length - 2)).join(' ');
+    fetchSuggestions('', newContext);
+    hideSuggestions();
+}
+
+function displaySuggestions(words, prefix, didYouMean) {
     suggestionsList.innerHTML = "";
+    if (didYouMean) {
+        const dymLi = document.createElement("li");
+        dymLi.className = "didyoumean";
+        dymLi.innerHTML = `Did you mean: <strong>${escapeHtml(didYouMean)}</strong>?`;
+        dymLi.addEventListener("click", () => {
+            searchInput.value = didYouMean + " ";
+            hideSuggestions();
+            fetchSuggestionsAfterInsert(searchInput.value);
+        });
+        suggestionsList.appendChild(dymLi);
+    }
+
     if (!words || words.length === 0) {
-        hideSuggestions();
+        suggestionsList.hidden = !didYouMean;
         return;
     }
+
     const lowerPrefix = (prefix || "").toLowerCase();
     words.forEach((w, idx) => {
         const li = document.createElement("li");
@@ -150,6 +218,7 @@ searchInput.addEventListener("keydown", (e) => {
     const lis = [...document.querySelectorAll(".suggestions li")];
     const count = lis.length;
 
+    // Arrow navigation
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         if (count === 0) return;
         e.preventDefault();
@@ -162,11 +231,27 @@ searchInput.addEventListener("keydown", (e) => {
     }
 
     if (e.key === "Enter") {
+        // if arrow selected item, accept it
         if (selectedIndex >= 0 && selectedIndex < count) {
             e.preventDefault();
             const chosen = lis[selectedIndex].dataset.value;
-            acceptSuggestion(chosen);
+            if (chosen) acceptSuggestion(chosen);
+            return;
         }
+
+        // else, if did-you-mean row exists, accept it
+        const didRow = suggestionsList.querySelector("li.didyoumean");
+        if (didRow) {
+            e.preventDefault();
+            const val = didRow.dataset.value || didRow.textContent;
+            if (val) {
+                applyDidYouMean(val.trim());
+                postAccept(val.trim());
+            }
+            return;
+        }
+
+        // else no selection and no didyoumean -> do nothing special (let form submit if any)
         return;
     }
 
@@ -178,7 +263,7 @@ searchInput.addEventListener("keydown", (e) => {
 
 // click outside to hide
 document.addEventListener("click", (e) => {
-    if (!e.target.closest(".search-box") && !e.target.closest(".suggestions")) {
+    if (!e.target.closest(".predictive-box") && !e.target.closest(".suggestions")) {
         hideSuggestions();
     }
 });
@@ -191,7 +276,8 @@ function escapeHtml(s) {
 async function showTrending() {
     try {
         // request backend for suggestions with empty prefix/context
-        const resp = await fetch(`/api/suggest?q=&context=&limit=12`, { headers: { 'Accept': 'application/json' } });
+        const userId = localStorage.getItem('demoUserId') || '';
+        const resp = await fetch(`/api/suggest?q=&context=&limit=12&userId=${encodeURIComponent(userId)}`, { headers: { 'Accept': 'application/json' } });
         if (!resp.ok) {
             console.warn('Trending fetch failed status', resp.status);
             renderTrendingFallback();
