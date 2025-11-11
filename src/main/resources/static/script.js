@@ -1,33 +1,25 @@
-// Stable dropdown-only frontend (no inline grey prediction)
-// Adds robust "Did you mean" UI + keyboard handling
+// Stable dropdown-only frontend (Did-You-Mean + trending + arrow nav)
 
 const searchInput = document.getElementById("searchInput");
 const suggestionsList = document.getElementById("suggestionsList");
-const debug = document.getElementById("debug");
 const trendingList = document.getElementById("trendingList");
+const debug = document.getElementById("debug");
 
 let debounceTimer = null;
 const DEBOUNCE_MS = 160;
 let selectedIndex = -1;
 let suggestions = [];
 
-// ---------------- Helpers ----------------
 function hideSuggestions() {
     suggestionsList.innerHTML = "";
     suggestionsList.hidden = true;
     selectedIndex = -1;
 }
 
-function showDebug(msg) {
-    if (!debug) return;
-    debug.hidden = false;
-    debug.textContent = msg;
-}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
 
-// Build prefix and context for the current input.
-// Returns { prefix, context } where prefix is the current token after last space.
 function buildPrefixContext(full) {
-    const trailingRemoved = full.replace(/\s+$/, ""); // remove trailing spaces for token detection
+    const trailingRemoved = full.replace(/\s+$/, "");
     const lastSpace = trailingRemoved.lastIndexOf(" ");
     if (lastSpace === -1) {
         return { prefix: trailingRemoved, context: "" };
@@ -40,140 +32,36 @@ function buildPrefixContext(full) {
     }
 }
 
-// Accept a suggestion: replace either the current token or the left context (if phrase)
-function acceptSuggestion(selected) {
-    const full = searchInput.value;
-    const { prefix, context } = buildPrefixContext(full);
-    const sel = selected.trim();
-
-    // If suggestion is a phrase and begins with the context, replace left-side with phrase
-    if (sel.includes(" ") && context) {
-        const lowerSel = sel.toLowerCase();
-        const lowerContext = context.toLowerCase();
-        if (lowerSel.startsWith(lowerContext)) {
-            // Replace everything up to the start of current prefix with the phrase
-            const leftPart = full.slice(0, full.lastIndexOf(prefix)); // preserve any leading whitespace positions
-            searchInput.value = (leftPart + sel).trim() + " ";
-            hideSuggestions();
-            fetchSuggestionsAfterInsert(searchInput.value);
-            return;
-        }
-    }
-
-    // Otherwise replace only the current prefix token
-    if (prefix === "") {
-        // At a space. Append selection.
-        searchInput.value = (full + sel + " ").replace(/\s+/g, " ").trimLeft();
-    } else {
-        const trimmedEnd = full.replace(/\s+$/, "");
-        const lastSpace = trimmedEnd.lastIndexOf(" ");
-        const start = lastSpace === -1 ? 0 : lastSpace + 1;
-        const left = full.substring(0, start);
-        searchInput.value = (left + sel + " ").replace(/\s+/g, " ").trimLeft();
-    }
-
-    hideSuggestions();
-    // report acceptance to backend (personalization)
-    postAccept(sel);
-    fetchSuggestionsAfterInsert(searchInput.value);
-}
-
-function fetchSuggestionsAfterInsert(newFullValue) {
-    const trimmed = newFullValue.trim();
-    const parts = trimmed ? trimmed.split(/\s+/) : [];
-    const ctx = parts.slice(Math.max(0, parts.length - 2)).join(" ");
-    // prefix empty because we appended a trailing space
-    fetchSuggestions("", ctx);
-}
-
-function postAccept(selected) {
-    const userId = localStorage.getItem('demoUserId') || '';
-    fetch('/api/accept', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ userId: userId, selected: selected })
-    }).catch(() => {});
-}
-
-// ---------------- Fetch + Render ----------------
 async function fetchSuggestions(prefix, context) {
     try {
         const limit = 6;
-        const resp = await fetch(`/api/suggest?q=${encodeURIComponent(prefix)}&context=${encodeURIComponent(context)}&limit=${limit}`);
-        if (!resp.ok) {
-            hideSuggestions();
-            showDebug(`HTTP ${resp.status}`);
-            return;
-        }
+        const url = `/api/suggest?q=${encodeURIComponent(prefix)}&context=${encodeURIComponent(context)}&limit=${limit}`;
+        const resp = await fetch(url, { headers: { "Accept": "application/json" }});
+        if (!resp.ok) { hideSuggestions(); return; }
         const body = await resp.json();
+
+        const dym = body?.didYouMean || body?.didyoumean || body?.correction || null;
         const items = Array.isArray(body?.suggestions) ? body.suggestions : [];
         suggestions = items.map(s => (typeof s === "string") ? s : (s.text ?? s.word ?? "")).filter(Boolean);
 
-        // Get Did You Mean suggestion
-        const dym = body?.didYouMean ?? body?.didyoumean ?? null;
-
-        displaySuggestions(suggestions, prefix, dym);
-        showDebug(`took ${body?.meta?.tookMs ?? "?"} ms • ${suggestions.length}`);
-    } catch (err) {
-        console.error("fetch error", err);
-        hideSuggestions();
-    }
+        renderSuggestions(suggestions, prefix, dym);
+    } catch (e) { console.error(e); hideSuggestions(); }
 }
 
-function insertDidYouMeanRow(replacement) {
-    // remove existing didyoumean row if any
-    const existing = suggestionsList.querySelector("li.didyoumean");
-    if (existing) existing.remove();
-
-    const hintLi = document.createElement("li");
-    hintLi.className = "didyoumean";
-    hintLi.tabIndex = 0;
-    hintLi.dataset.value = replacement;
-    hintLi.innerHTML = `Did you mean: <strong>${escapeHtml(replacement)}</strong>? (click or press Enter)`;
-    hintLi.addEventListener("click", () => {
-        applyDidYouMean(replacement);
-        postAccept(replacement);
-    });
-    hintLi.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") {
-            ev.preventDefault();
-            hintLi.click();
-        }
-    });
-
-    // insert at top
-    suggestionsList.insertBefore(hintLi, suggestionsList.firstChild);
-}
-
-// Apply replacement into input and fetch next suggestions
-function applyDidYouMean(replacement) {
-    const full = searchInput.value;
-    const trimmedEnd = full.replace(/\s+$/, '');
-    const lastSpace = trimmedEnd.lastIndexOf(' ');
-    if (lastSpace === -1) {
-        searchInput.value = replacement + ' ';
-    } else {
-        const left = full.substring(0, lastSpace + 1); // include trailing space
-        searchInput.value = left + replacement + ' ';
-    }
-    const parts = searchInput.value.trim().split(/\s+/);
-    const newContext = parts.slice(Math.max(0, parts.length - 2)).join(' ');
-    fetchSuggestions('', newContext);
-    hideSuggestions();
-}
-
-function displaySuggestions(words, prefix, didYouMean) {
+function renderSuggestions(words, prefix, didYouMean) {
     suggestionsList.innerHTML = "";
     if (didYouMean) {
-        const dymLi = document.createElement("li");
-        dymLi.className = "didyoumean";
-        dymLi.innerHTML = `Did you mean: <strong>${escapeHtml(didYouMean)}</strong>?`;
-        dymLi.addEventListener("click", () => {
-            searchInput.value = didYouMean + " ";
-            hideSuggestions();
-            fetchSuggestionsAfterInsert(searchInput.value);
+        const li = document.createElement("li");
+        li.className = "didyoumean";
+        li.tabIndex = 0;
+        li.dataset.value = didYouMean;
+        li.innerHTML = `Did you mean: <strong>${escapeHtml(didYouMean)}</strong>? (click or Enter)`;
+        li.addEventListener("click", () => {
+            applyReplacement(didYouMean);
+            postAccept(didYouMean);
         });
-        suggestionsList.appendChild(dymLi);
+        li.addEventListener("keydown", (e)=>{ if (e.key === "Enter"){ e.preventDefault(); li.click(); }});
+        suggestionsList.appendChild(li);
     }
 
     if (!words || words.length === 0) {
@@ -192,147 +80,116 @@ function displaySuggestions(words, prefix, didYouMean) {
         }
         li.dataset.index = idx;
         li.dataset.value = w;
-        li.addEventListener("click", () => acceptSuggestion(w));
+        li.addEventListener("click", () => { applyReplacement(w); postAccept(w); });
         suggestionsList.appendChild(li);
     });
     selectedIndex = -1;
     suggestionsList.hidden = false;
 }
 
-// ---------------- Keys + Input ----------------
-searchInput.addEventListener("input", (e) => {
+function applyReplacement(selected) {
+    const full = searchInput.value;
+    const trailingRemoved = full.replace(/\s+$/, "");
+    const lastSpace = trailingRemoved.lastIndexOf(" ");
+    if (lastSpace === -1) {
+        searchInput.value = selected + " ";
+    } else {
+        const left = full.substring(0, lastSpace + 1);
+        searchInput.value = left + selected + " ";
+    }
+    hideSuggestions();
+    // fetch next suggestions for new context
+    const parts = searchInput.value.trim().split(/\s+/);
+    const ctx = parts.slice(Math.max(0, parts.length - 2)).join(" ");
+    fetchSuggestions("", ctx);
+}
+
+function postAccept(selected) {
+    const userId = localStorage.getItem('demoUserId') || '';
+    fetch('/api/accept', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ userId: userId, selected: selected })
+    }).catch(()=>{});
+}
+
+searchInput.addEventListener("input", (e)=>{
     clearTimeout(debounceTimer);
     const full = e.target.value;
-    if (!full || full.trim().length === 0) {
-        hideSuggestions();
-        showTrending(); // show trending when input empty
-        return;
-    }
+    if (!full || full.trim().length === 0) { hideSuggestions(); showTrending(); return; }
     debounceTimer = setTimeout(() => {
         const { prefix, context } = buildPrefixContext(full);
         fetchSuggestions(prefix.trim(), context.trim());
     }, DEBOUNCE_MS);
 });
 
-searchInput.addEventListener("keydown", (e) => {
+searchInput.addEventListener("keydown", (e)=>{
     const lis = [...document.querySelectorAll(".suggestions li")];
     const count = lis.length;
 
-    // Arrow navigation
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         if (count === 0) return;
         e.preventDefault();
         selectedIndex = (e.key === "ArrowDown")
             ? (selectedIndex + 1 + count) % count
             : (selectedIndex - 1 + count) % count;
-        lis.forEach((li, i) => li.classList.toggle("active", i === selectedIndex));
+        lis.forEach((li, i)=> li.classList.toggle("active", i === selectedIndex));
         if (selectedIndex >= 0 && lis[selectedIndex]) lis[selectedIndex].scrollIntoView({ block: "nearest" });
         return;
     }
 
     if (e.key === "Enter") {
-        // if arrow selected item, accept it
         if (selectedIndex >= 0 && selectedIndex < count) {
             e.preventDefault();
             const chosen = lis[selectedIndex].dataset.value;
-            if (chosen) acceptSuggestion(chosen);
+            if (chosen) { applyReplacement(chosen); postAccept(chosen); }
             return;
         }
-
-        // else, if did-you-mean row exists, accept it
-        const didRow = suggestionsList.querySelector("li.didyoumean");
-        if (didRow) {
+        // if there is a didyoumean row and no selection, accept it
+        const did = suggestionsList.querySelector("li.didyoumean");
+        if (did) {
             e.preventDefault();
-            const val = didRow.dataset.value || didRow.textContent;
-            if (val) {
-                applyDidYouMean(val.trim());
-                postAccept(val.trim());
-            }
+            const v = did.dataset.value || did.textContent;
+            if (v) { applyReplacement(v.trim()); postAccept(v.trim()); }
             return;
         }
-
-        // else no selection and no didyoumean -> do nothing special (let form submit if any)
         return;
     }
 
-    if (e.key === "Escape") {
-        hideSuggestions();
-        return;
-    }
+    if (e.key === "Escape") { hideSuggestions(); return; }
 });
 
-// click outside to hide
-document.addEventListener("click", (e) => {
-    if (!e.target.closest(".predictive-box") && !e.target.closest(".suggestions")) {
-        hideSuggestions();
-    }
+document.addEventListener("click", (e)=>{
+    if (!e.target.closest(".predictive-box") && !e.target.closest(".suggestions")) hideSuggestions();
 });
 
-function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
-}
-
-// ---------------- Trending ----------------
-async function showTrending() {
+// Trending
+async function showTrending(){
     try {
-        // request backend for suggestions with empty prefix/context
-        const userId = localStorage.getItem('demoUserId') || '';
-        const resp = await fetch(`/api/suggest?q=&context=&limit=12&userId=${encodeURIComponent(userId)}`, { headers: { 'Accept': 'application/json' } });
-        if (!resp.ok) {
-            console.warn('Trending fetch failed status', resp.status);
-            renderTrendingFallback();
-            return;
-        }
-
+        const resp = await fetch(`/api/suggest?q=&context=&limit=12`);
+        if (!resp.ok) { renderTrendingFallback(); return; }
         const body = await resp.json();
         const items = Array.isArray(body?.suggestions) ? body.suggestions : [];
-
-        trendingList.innerHTML = '';
-
-        // Normalize each item to a display string
-        const normalized = items
-            .map(s => (typeof s === 'string') ? s : (s.text ?? s.word ?? s.getText ?? ''))
-            .filter(Boolean);
-
-        if (normalized.length === 0) {
-            renderTrendingFallback();
-            return;
-        }
-
-        // show up to 12 items
-        normalized.slice(0, 12).forEach(text => {
-            const li = document.createElement('li');
+        trendingList.innerHTML = "";
+        const normalized = items.map(s => (typeof s==="string")?s:(s.text??s.word??"")).filter(Boolean);
+        if (normalized.length === 0) { renderTrendingFallback(); return; }
+        normalized.slice(0,12).forEach(text=>{
+            const li = document.createElement("li");
             li.textContent = text;
-            li.addEventListener('click', () => {
-                // clicking trending inserts the phrase and requests next suggestions
-                searchInput.value = text + ' ';
-                fetchSuggestions('', text);
-            });
+            li.addEventListener("click", ()=>{ searchInput.value = text + " "; fetchSuggestions("", text); });
             trendingList.appendChild(li);
         });
-
-    } catch (err) {
-        console.warn('trending fetch error', err);
-        renderTrendingFallback();
-    }
+    } catch (e) { renderTrendingFallback(); }
 }
-function renderTrendingFallback() {
-    trendingList.innerHTML = '';
-    const fallback = ['the', 'to', 'is', 'it', 'you', 'i', 'a', 'for', 'in', 'on', 'and', 'that'];
-    fallback.slice(0, 12).forEach(t => {
-        const li = document.createElement('li');
-        li.textContent = t;
-        li.addEventListener('click', () => {
-            searchInput.value = t + ' ';
-            fetchSuggestions('', t);
-        });
+function renderTrendingFallback(){
+    trendingList.innerHTML = "";
+    ['the','to','is','it','you','i','a','for','in','on','and','that'].slice(0,12).forEach(t=>{
+        const li = document.createElement("li"); li.textContent = t;
+        li.addEventListener("click", ()=>{ searchInput.value = t + " "; fetchSuggestions("", t); });
         trendingList.appendChild(li);
     });
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-    // show trending immediately on load
-    showTrending();
-});
+window.addEventListener('DOMContentLoaded', ()=>{ showTrending(); });
 hideSuggestions();
 showTrending();
